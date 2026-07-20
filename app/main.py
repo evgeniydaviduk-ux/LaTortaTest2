@@ -186,7 +186,31 @@ async def fetch(client: httpx.AsyncClient, url: str) -> str | None:
         log.warning("Fetch failed %s: %s", url, exc)
         return None
 
+
+async def extract_links(client: httpx.AsyncClient, page_url: str) -> set[str]:
+    """Extract only same-domain Ukrainian links from a page."""
+    html = await fetch(client, page_url)
+    if not html:
+        return set()
+    soup = BeautifulSoup(html, "lxml")
+    links: set[str] = set()
+    for anchor in soup.select("a[href]"):
+        href = anchor.get("href")
+        if not href:
+            continue
+        absolute = urljoin(page_url, href).split("#")[0]
+        parsed = urlparse(absolute)
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.netloc.endswith("la-torta.ua")
+            and "/ua/" in parsed.path
+        ):
+            links.add(absolute)
+    return links
+
+
 async def sitemap_urls(client: httpx.AsyncClient) -> list[str]:
+    """Get site URLs from sitemap; if unavailable, crawl category pages."""
     pending = [
         urljoin(SITE_URL, "/sitemap.xml"),
         urljoin(SITE_URL, "/sitemap_index.xml"),
@@ -195,7 +219,7 @@ async def sitemap_urls(client: httpx.AsyncClient) -> list[str]:
     seen: set[str] = set()
     urls: set[str] = set()
 
-    while pending and len(seen) < 40:
+    while pending and len(seen) < 50:
         sitemap = pending.pop(0)
         if sitemap in seen:
             continue
@@ -216,23 +240,132 @@ async def sitemap_urls(client: httpx.AsyncClient) -> list[str]:
             location = clean(element.text)
             if location.endswith(".xml"):
                 pending.append(location)
-            elif urlparse(location).netloc.endswith("la-torta.ua") and "/ua/" in location:
+            elif (
+                urlparse(location).netloc.endswith("la-torta.ua")
+                and "/ua/" in urlparse(location).path
+            ):
                 urls.add(location)
 
-    if urls:
+    if len(urls) >= 50:
+        log.info("Loaded %s URLs from sitemap", len(urls))
         return list(urls)
 
-    home = await fetch(client, SITE_URL)
-    if not home:
-        return []
+    # Reliable fallback for sites whose sitemap is blocked or non-standard:
+    # breadth-first crawl of the homepage, category and pagination pages.
+    queue = [SITE_URL]
+    visited_pages: set[str] = set()
+    discovered: set[str] = set(urls)
+    excluded = (
+        "/blog", "/contacts", "/shipping", "/payment", "/about",
+        "/reviews", "/login", "/register", "/compare", "/wishlist",
+        "/cart", "/checkout",
+    )
 
-    soup = BeautifulSoup(home, "lxml")
-    return list({
-        urljoin(SITE_URL, link.get("href"))
-        for link in soup.select("a[href]")
-        if "/ua/" in urljoin(SITE_URL, link.get("href"))
-        and urlparse(urljoin(SITE_URL, link.get("href"))).netloc.endswith("la-torta.ua")
-    })
+    while queue and len(visited_pages) < 180 and len(discovered) < MAX_PAGES * 3:
+        page_url = queue.pop(0)
+        if page_url in visited_pages:
+            continue
+        visited_pages.add(page_url)
+
+        page_links = await extract_links(client, page_url)
+        for link in page_links:
+            if any(part in link.lower() for part in excluded):
+                continue
+            discovered.add(link)
+
+            # Crawl likely category/listing/pagination pages, but not every product page.
+            path = urlparse(link).path.lower()
+            query = urlparse(link).query.lower()
+            depth = len([part for part in path.split("/") if part])
+            likely_listing = (
+                "page=" in query
+                or "/category" in path
+                or depth <= 4
+            )
+            if likely_listing and link not in visited_pages and len(queue) < 500:
+                queue.append(link)
+
+    log.info(
+        "Fallback crawl visited %s pages and discovered %s URLs",
+        len(visited_pages),
+        len(discovered),
+    )
+    return list(discovered)
+
+
+async def direct_site_search(query: str, limit: int = 8) -> list[dict]:
+    """Search the live website when the local index is empty or stale."""
+    encoded = httpx.QueryParams({"q": query})
+    candidates = [
+        f"{SITE_URL.rstrip('/')}/search/?{encoded}",
+        f"{SITE_URL.rstrip('/')}/search?{encoded}",
+        f"https://la-torta.ua/ua/search/?{encoded}",
+    ]
+    found: dict[str, dict] = {}
+
+    async with httpx.AsyncClient(headers=HEADERS) as client:
+        for search_url in candidates:
+            html = await fetch(client, search_url)
+            if not html:
+                continue
+            soup = BeautifulSoup(html, "lxml")
+
+            # Parse links from product cards and then verify the target page itself.
+            selectors = [
+                ".catalogCard-title a[href]",
+                ".product-card a[href]",
+                ".products-list a[href]",
+                ".catalog-grid a[href]",
+                "a[href]",
+            ]
+            links: list[str] = []
+            for selector in selectors:
+                for anchor in soup.select(selector):
+                    href = anchor.get("href")
+                    if not href:
+                        continue
+                    absolute = urljoin(search_url, href).split("#")[0]
+                    if (
+                        urlparse(absolute).netloc.endswith("la-torta.ua")
+                        and "/ua/" in urlparse(absolute).path
+                        and absolute not in links
+                    ):
+                        links.append(absolute)
+                if links:
+                    break
+
+            semaphore = asyncio.Semaphore(5)
+
+            async def inspect(url: str):
+                async with semaphore:
+                    product_html = await fetch(client, url)
+                    return parse_product(url, product_html) if product_html else None
+
+            for product in await asyncio.gather(
+                *(inspect(url) for url in links[:30])
+            ):
+                if product:
+                    found[product["url"]] = product
+                    await upsert_product(product)
+                    if len(found) >= limit:
+                        return list(found.values())[:limit]
+
+    return list(found.values())[:limit]
+
+
+async def verify_product_url(url: str) -> bool:
+    """Never send a URL unless it resolves to a real La-Torta product page."""
+    parsed = urlparse(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc.endswith("la-torta.ua")
+        or "/ua/" not in parsed.path
+    ):
+        return False
+
+    async with httpx.AsyncClient(headers=HEADERS) as client:
+        html = await fetch(client, url)
+        return bool(html and parse_product(url, html))
 
 def parse_product(url: str, html: str) -> dict | None:
     soup = BeautifulSoup(html, "lxml")
@@ -385,6 +518,7 @@ async def refresh_catalog() -> int:
     finally:
         catalog_state["running"] = False
 
+
 async def search_products(query: str, limit: int = 4) -> list[dict]:
     products = await all_products()
     normalized = clean(query).lower()
@@ -403,7 +537,13 @@ async def search_products(query: str, limit: int = 4) -> list[dict]:
             scored.append((score, product))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [product for _, product in scored[:limit]]
+    local_results = [product for _, product in scored[:limit]]
+
+    # Use the site's live search if the index has no confident result.
+    if not local_results:
+        return await direct_site_search(query, limit=limit)
+
+    return local_results
 
 async def ai_answer(chat_id: int, text: str, products: list[dict]) -> str:
     if not openai_client:
@@ -437,7 +577,9 @@ async def ai_answer(chat_id: int, text: str, products: list[dict]) -> str:
 Для точного залишку у фізичному магазині, повернення, претензії,
 оптової ціни або зміни замовлення запропонуй менеджера.
 Не кажи, що замовлення створене або товар зарезервований.
-Картки товарів бот надішле окремо, тому не дублюй довгі URL.
+Картки товарів бот надішле окремо.
+ЗАБОРОНЕНО писати будь-які URL, посилання, домени або вигадувати адресу сторінки.
+Навіть якщо клієнт просить посилання, скажи, що перевірені картки будуть нижче.
 
 БАЗА ЗНАНЬ:
 {knowledge}
@@ -459,7 +601,11 @@ async def ai_answer(chat_id: int, text: str, products: list[dict]) -> str:
         input=input_messages,
         max_output_tokens=420,
     )
-    return response.output_text.strip()
+    answer = response.output_text.strip()
+    # Defense in depth: AI text can never contain clickable or invented URLs.
+    answer = re.sub(r"https?://\\S+|www\\.\\S+|la-torta\\.ua\\S*", "", answer, flags=re.IGNORECASE)
+    answer = re.sub(r"\\n{3,}", "\\n\\n", answer).strip()
+    return answer
 
 def product_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -572,6 +718,27 @@ async def status_handler(message: Message) -> None:
         f"Оновлення виконується: {'так' if catalog_state['running'] else 'ні'}"
     )
 
+
+@router.message(Command("searchtest"))
+async def searchtest_handler(message: Message) -> None:
+    query = message.text.partition(" ")[2].strip() or "шоколад"
+    await message.answer(f"Перевіряю сайт за запитом: <b>{query}</b>")
+    results = await search_products(query, limit=3)
+    verified = []
+    for product in results:
+        if await verify_product_url(product["url"]):
+            verified.append(product)
+    if not verified:
+        await message.answer(
+            "Пошук не знайшов перевірених карток. Перевірте Render Logs: "
+            "там будуть повідомлення Fetch failed або Catalog progress."
+        )
+        return
+    await message.answer(
+        "Перевірені результати:\n" +
+        "\n".join(f"• {product['title']}" for product in verified)
+    )
+
 @router.channel_post()
 async def channel_post_handler(message: Message) -> None:
     text = message.text or message.caption or ""
@@ -602,7 +769,20 @@ async def chat_handler(message: Message, bot: Bot) -> None:
     await save_message(message.chat.id, "assistant", answer)
     await message.answer(answer)
 
+    verified_products = []
     for product in products[:3]:
+        if await verify_product_url(product["url"]):
+            verified_products.append(product)
+        else:
+            log.warning("Rejected unverified product URL: %s", product.get("url"))
+
+    if products and not verified_products:
+        await message.answer(
+            "Знайдені результати не пройшли перевірку сайту, тому я не надсилаю "
+            "непідтверджені посилання. Спробуйте уточнити назву або зверніться до менеджера."
+        )
+
+    for product in verified_products:
         caption = f"<b>{product['title']}</b>"
         if product.get("price"):
             caption += f"\nЦіна на сторінці: {product['price']}"
@@ -675,6 +855,7 @@ async def set_commands(bot: Bot) -> None:
         BotCommand(command="manager", description="Покликати менеджера"),
         BotCommand(command="myid", description="Показати мій Telegram ID"),
         BotCommand(command="status", description="Статус бота"),
+        BotCommand(command="searchtest", description="Перевірити пошук"),
     ])
 
 async def main() -> None:
